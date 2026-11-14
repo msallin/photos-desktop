@@ -1158,6 +1158,27 @@ fn mark_not_indexed(path: &std::path::Path) {
     };
 }
 
+/// The names in `dir` that are cloud-only placeholders already kept out of the index.
+/// For these, populate would fail to create, find nothing to reconcile and nothing to
+/// mark, so it can pass them by. One directory read: it opens no file, so recalls nothing.
+#[cfg(windows)]
+fn settled_placeholders(dir: &std::path::Path) -> std::collections::HashSet<String> {
+    use std::os::windows::fs::MetadataExt;
+    const RECALL_ON_DATA_ACCESS: u32 = 0x0040_0000;
+    const NOT_CONTENT_INDEXED: u32 = 0x0000_2000;
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return Default::default();
+    };
+    entries
+        .flatten()
+        .filter_map(|entry| {
+            let attrs = entry.metadata().ok()?.file_attributes();
+            let settled = attrs & RECALL_ON_DATA_ACCESS != 0 && attrs & NOT_CONTENT_INDEXED != 0;
+            settled.then(|| entry.file_name().to_string_lossy().to_lowercase())
+        })
+        .collect()
+}
+
 /// Whether one placeholder (relative path from the sync root) is hydrated (has its
 /// data on the device). Dehydrated cloud-only placeholders carry RECALL_ON_DATA_ACCESS.
 #[cfg(windows)]
@@ -2139,6 +2160,7 @@ fn populate_flat(app: &tauri::AppHandle, root: &std::path::Path, rel_dir: &str, 
         return 0;
     }
     mark_not_indexed(&dir);
+    let settled = settled_placeholders(&dir);
     let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
     let mut made = 0usize;
     for (uid, base, size, ft) in photos {
@@ -2146,17 +2168,22 @@ fn populate_flat(app: &tauri::AppHandle, root: &std::path::Path, rel_dir: &str, 
             continue;
         }
         let unique = unique_name(base, &mut seen);
-        let placeholder = PlaceholderFile::new(&unique)
-            .mark_in_sync()
-            .metadata(Metadata::file().size(*size).creation_time(*ft).last_write_time(*ft))
-            .blob(uid.as_bytes().to_vec());
-        let owned = if placeholder.create::<&std::path::Path>(&dir).is_ok() {
-            made += 1;
+        let owned = if settled.contains(&unique.to_lowercase()) {
             true
         } else {
-            reconcile_existing(app, &dir.join(&unique), uid, *size) != Existing::Foreign
+            let placeholder = PlaceholderFile::new(&unique)
+                .mark_in_sync()
+                .metadata(Metadata::file().size(*size).creation_time(*ft).last_write_time(*ft))
+                .blob(uid.as_bytes().to_vec());
+            let owned = if placeholder.create::<&std::path::Path>(&dir).is_ok() {
+                made += 1;
+                true
+            } else {
+                reconcile_existing(app, &dir.join(&unique), uid, *size) != Existing::Foreign
+            };
+            mark_not_indexed(&dir.join(&unique));
+            owned
         };
-        mark_not_indexed(&dir.join(&unique));
         if owned {
             index_push(uid, &format!("{rel_dir}\\{unique}"));
         }
@@ -2363,6 +2390,7 @@ fn try_populate(app: &tauri::AppHandle) -> Result<(), String> {
     }
     std::fs::create_dir_all(&photos_dir).map_err(|e| e.to_string())?;
     mark_not_indexed(&photos_dir);
+    let settled = settled_placeholders(&photos_dir);
 
     // Page through the photos so the sidecar RPC lock is released between pages,
     // keeping the app responsive (thumbnails keep loading) during populate. A page is
@@ -2414,11 +2442,14 @@ fn try_populate(app: &tauri::AppHandle) -> Result<(), String> {
             mount_sizes().lock().unwrap().insert(uid.to_string(), size);
             all_uids.push(uid.to_string());
 
+            let settled_here = settled.contains(&unique.to_lowercase());
             let placeholder = PlaceholderFile::new(&unique)
                 .mark_in_sync() // it faithfully mirrors the cloud file: in sync, not "pending"
                 .metadata(Metadata::file().size(size).creation_time(ft).last_write_time(ft))
                 .blob(uid.as_bytes().to_vec());
-            let owned = if placeholder.create::<&std::path::Path>(&photos_dir).is_ok() {
+            let owned = if settled_here {
+                true
+            } else if placeholder.create::<&std::path::Path>(&photos_dir).is_ok() {
                 made += 1;
                 true
             } else {
@@ -2452,7 +2483,9 @@ fn try_populate(app: &tauri::AppHandle) -> Result<(), String> {
             // folder's bit, but that inheritance is undocumented, and an already
             // downloaded copy predates the folder entirely and would otherwise keep
             // handing its EXIF to the indexer.
-            mark_not_indexed(&photos_dir.join(&unique));
+            if !settled_here {
+                mark_not_indexed(&photos_dir.join(&unique));
+            }
         }
 
         offset += page;
@@ -2586,6 +2619,7 @@ fn populate_albums(
                 continue;
             }
             mark_not_indexed(&album_folder);
+            let settled = settled_placeholders(&album_folder);
             let mut file_seen: HashSet<String> = HashSet::new();
             let mut members: Vec<String> = Vec::new();
             for u in &uids {
@@ -2593,20 +2627,25 @@ fn populate_albums(
                 let Some((base, size, ft)) = meta.get(uid) else { continue };
                 let unique = unique_name(base, &mut file_seen);
                 let rel = format!("Albums\\{dir_name}\\{unique}");
-                let placeholder = PlaceholderFile::new(&unique)
-                    .mark_in_sync()
-                    .metadata(Metadata::file().size(*size).creation_time(*ft).last_write_time(*ft))
-                    .blob(uid.as_bytes().to_vec());
-                let owned = if placeholder.create::<&std::path::Path>(&album_folder).is_ok() {
-                    made += 1;
+                let owned = if settled.contains(&unique.to_lowercase()) {
                     true
                 } else {
-                    // A copy already sits here: reconcile it so Explorer shows the green
-                    // check instead of "waiting to sync". A cloud-only one needs nothing
-                    // doing and is ours all the same, so only a foreign file is excluded.
-                    reconcile_existing(app, &album_folder.join(&unique), uid, *size) != Existing::Foreign
+                    let placeholder = PlaceholderFile::new(&unique)
+                        .mark_in_sync()
+                        .metadata(Metadata::file().size(*size).creation_time(*ft).last_write_time(*ft))
+                        .blob(uid.as_bytes().to_vec());
+                    let owned = if placeholder.create::<&std::path::Path>(&album_folder).is_ok() {
+                        made += 1;
+                        true
+                    } else {
+                        // A copy already sits here: reconcile it so Explorer shows the green
+                        // check instead of "waiting to sync". A cloud-only one needs nothing
+                        // doing and is ours all the same, so only a foreign file is excluded.
+                        reconcile_existing(app, &album_folder.join(&unique), uid, *size) != Existing::Foreign
+                    };
+                    mark_not_indexed(&album_folder.join(&unique));
+                    owned
                 };
-                mark_not_indexed(&album_folder.join(&unique));
                 // Indexed only once it belongs to the mount, on the same grounds as the
                 // `Photos\` pass: an album copy that was neither created nor adopted is
                 // someone else's file with a name that happens to match, and both indexes
